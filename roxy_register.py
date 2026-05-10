@@ -9,12 +9,10 @@ import time
 import secrets
 import hashlib
 import base64
-import socket
-import threading
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import re
 import requests as _requests
 
 from kiro_register import (
@@ -25,6 +23,71 @@ from kiro_register import (
 )
 
 import random as _random
+
+
+class _RequestsMailClient:
+    """使用标准 requests 库的邮件客户端，避免 curl_cffi SSL 问题"""
+
+    def __init__(self, base_url: str, api_key: str, domain_id=None):
+        self.base_url = base_url.rstrip("/")
+        self.domain_id = int(domain_id) if domain_id and str(domain_id).isdigit() else 0
+        self.session = _requests.Session()
+        self.session.verify = False
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        self.mailbox_id = None
+        self.address = None
+
+    def create_mailbox(self) -> str:
+        resp = self.session.post(
+            f"{self.base_url}/api/v1/mailboxes",
+            json={"domainId": self.domain_id, "expiresInHours": 3},
+            timeout=15,
+        )
+        data = resp.json()
+        self.mailbox_id = data["id"]
+        self.address = data["address"]
+        return self.address
+
+    def wait_otp(self, timeout: int = 120, poll_interval: int = 3) -> str:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = self.session.get(
+                f"{self.base_url}/api/v1/mailboxes/{self.mailbox_id}/messages",
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                messages = resp.json()
+                items = messages.get("items", []) if isinstance(messages, dict) else messages
+                if items:
+                    msg_id = items[0]["id"]
+                    ext_resp = self.session.get(
+                        f"{self.base_url}/api/v1/mailboxes/{self.mailbox_id}/messages/{msg_id}/extractions",
+                        timeout=10,
+                    )
+                    if ext_resp.status_code == 200:
+                        extractions = ext_resp.json()
+                        ext_items = extractions.get("items", extractions) if isinstance(extractions, dict) else extractions
+                        if isinstance(ext_items, list):
+                            for ext in ext_items:
+                                val = ext.get("value", "")
+                                if re.match(r'^\d{6}$', val):
+                                    return val
+                    detail_resp = self.session.get(
+                        f"{self.base_url}/api/v1/mailboxes/{self.mailbox_id}/messages/{msg_id}",
+                        timeout=10,
+                    )
+                    if detail_resp.status_code == 200:
+                        detail = detail_resp.json()
+                        body = detail.get("body", "") or detail.get("textBody", "") or detail.get("htmlBody", "") or str(detail)
+                        match = re.search(r'\b(\d{6})\b', body)
+                        if match:
+                            return match.group(1)
+            time.sleep(poll_interval)
+        return ""
 
 
 class RoxyBrowser:
@@ -45,7 +108,7 @@ class RoxyBrowser:
             return False
 
     def list_workspaces(self) -> list:
-        r = _requests.get(f"{self.base_url}/browser/workspace", headers=self.headers, timeout=10)
+        r = _requests.get(f"{self.base_url}/browser/workspace", headers=self.headers, timeout=30)
         data = r.json()
         if data.get("code") == 0:
             return data.get("data", {}).get("rows", []) or data.get("data", {}).get("list", [])
@@ -54,7 +117,7 @@ class RoxyBrowser:
     def list_windows(self, workspace_id: int) -> list:
         r = _requests.get(
             f"{self.base_url}/browser/list?workspaceId={workspace_id}",
-            headers=self.headers, timeout=10
+            headers=self.headers, timeout=30
         )
         data = r.json()
         if data.get("code") == 0:
@@ -170,7 +233,8 @@ async def register_with_roxy(
     Returns:
         dict with account info or None
     """
-    from curl_cffi import requests as curl_requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     from playwright.async_api import async_playwright
 
     if cancel_check and cancel_check():
@@ -232,13 +296,13 @@ async def register_with_roxy(
     log(f"CDP 连接: {ws_url[:60]}...", "ok")
 
     # ─── 准备注册信息 ───────────────────────────────────────────────────
-    from kiro_register import ShiroMailClient
-    s = curl_requests.Session(impersonate="chrome131")
+    s = _requests.Session()
+    s.verify = False
 
     if mail_provider_instance:
         mail = mail_provider_instance
     else:
-        mail = ShiroMailClient(base_url=mail_url, api_key=mail_key, domain_id=mail_domain_id)
+        mail = _RequestsMailClient(base_url=mail_url, api_key=mail_key, domain_id=mail_domain_id)
     email = mail.create_mailbox()
     password = _generate_password()
     full_name = _generate_name()
@@ -301,91 +365,10 @@ async def register_with_roxy(
         "redirect_from": "KiroIDE",
     })
 
-    # ─── Phase 2: 本地回调服务器 + CDP 连接 ─────────────────────────────
+    # ─── Phase 2: CDP 连接（不依赖本地回调服务器，通过路由拦截获取参数）────
     log("阶段 2: 启动 CDP 浏览器连接")
     authorization_code = ""
-
-    class CallbackHandler(BaseHTTPRequestHandler):
-        signin_callback_params = {}
-
-        def do_GET(self_h):
-            nonlocal authorization_code
-            parsed = urlparse(self_h.path)
-            qs = parse_qs(parsed.query)
-            code = qs.get("code", [""])[0]
-            if code:
-                authorization_code = code
-                log("已收到授权回调", "ok")
-                self_h.send_response(200)
-                self_h.send_header("Content-Type", "text/html")
-                self_h.end_headers()
-                self_h.wfile.write(b"<html><body><h2>Registration complete!</h2></body></html>")
-            elif "signin/callback" in parsed.path or qs.get("login_option"):
-                CallbackHandler.signin_callback_params = {k: v[0] for k, v in qs.items()}
-                log("收到登录回调", "ok")
-                self_h.send_response(200)
-                self_h.send_header("Content-Type", "text/html")
-                self_h.end_headers()
-                self_h.wfile.write(b"<html><body><p>Redirecting...</p></body></html>")
-            else:
-                self_h.send_response(200)
-                self_h.send_header("Content-Type", "text/html")
-                self_h.end_headers()
-                self_h.wfile.write(b"<html><body><p>OK</p></body></html>")
-
-        def log_message(self_h, *args):
-            pass
-
-    # 确保端口可用 - 强制清理
-    import os, subprocess
-    for _kill_attempt in range(3):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("127.0.0.1", 3128))
-            sock.close()
-            break
-        except OSError:
-            sock.close()
-            try:
-                r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
-                for line in r.stdout.splitlines():
-                    if ":3128" in line and "LISTENING" in line:
-                        pid = line.strip().split()[-1]
-                        if pid.isdigit() and int(pid) != os.getpid():
-                            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-                            log(f"已终止占用端口 3128 的进程 (PID={pid})", "warn")
-            except Exception:
-                pass
-            await asyncio.sleep(1.5)
-    else:
-        log("端口 3128 无法释放!", "err")
-        _cleanup()
-        return _partial_result("端口3128被占用")
-
-    try:
-        callback_server = HTTPServer(("127.0.0.1", 3128), CallbackHandler)
-        callback_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    except OSError as e:
-        log(f"回调服务器启动失败: {e}", "err")
-        _cleanup()
-        return _partial_result("回调服务器启动失败")
-    srv_thread = threading.Thread(target=callback_server.serve_forever, daemon=True)
-    srv_thread.start()
-
-    # 验证服务器确实在监听
-    await asyncio.sleep(0.3)
-    try:
-        _check_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _check_sock.settimeout(2)
-        _check_sock.connect(("127.0.0.1", 3128))
-        _check_sock.close()
-        log("本地回调服务器已启动 (127.0.0.1:3128)", "ok")
-    except Exception:
-        log("回调服务器启动后无法连接!", "err")
-        callback_server.shutdown()
-        _cleanup()
-        return _partial_result("回调服务器不可达")
+    signin_callback_params = {}
 
     try:
         async with async_playwright() as p:
@@ -403,6 +386,30 @@ async def register_with_roxy(
 
             log("CDP 浏览器已连接", "ok")
 
+            # 拦截所有到 127.0.0.1:3128 的请求，直接从 URL 提取参数
+            # 这样即使浏览器走代理也不影响回调捕获
+            async def _intercept_callback(route):
+                nonlocal authorization_code, signin_callback_params
+                url = route.request.url
+                parsed = urlparse(url)
+                qs = parse_qs(parsed.query)
+                code = qs.get("code", [""])[0]
+                if code:
+                    authorization_code = code
+                    log("已拦截授权回调 (route)", "ok")
+                elif "signin/callback" in parsed.path or qs.get("login_option"):
+                    signin_callback_params = {k: v[0] for k, v in qs.items()}
+                    log("已拦截登录回调 (route)", "ok")
+                # 返回一个假响应，避免浏览器报错
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="<html><body><h2>OK</h2></body></html>",
+                )
+
+            await page.route("**/127.0.0.1:3128/**", _intercept_callback)
+            await page.route("**/localhost:3128/**", _intercept_callback)
+
             # 拦截 profile.aws API 响应用于调试
             async def _on_profile_response(response):
                 url = response.url
@@ -415,10 +422,7 @@ async def register_with_roxy(
                         pass
             page.on("response", _on_profile_response)
 
-            # PLACEHOLDER_CONTINUE_2
-
-            await page.goto(signin_url, timeout=60000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.goto(signin_url, timeout=60000, wait_until="domcontentloaded")
             await asyncio.sleep(3)
             await _dismiss_cookie(page)
 
@@ -446,7 +450,7 @@ async def register_with_roxy(
 
                 if signin_clicked:
                     await asyncio.sleep(3)
-                    if not CallbackHandler.signin_callback_params:
+                    if not signin_callback_params:
                         try:
                             await page.evaluate("""() => {
                                 const btn = document.querySelector('#layout-viewport button:nth-child(3)') ||
@@ -458,12 +462,12 @@ async def register_with_roxy(
                         await asyncio.sleep(3)
 
                 for _ in range(20):
-                    if CallbackHandler.signin_callback_params:
+                    if signin_callback_params:
                         break
                     await asyncio.sleep(1)
 
             # 构造 OIDC authorize URL
-            if CallbackHandler.signin_callback_params and not authorization_code:
+            if signin_callback_params and not authorization_code:
                 log("正在跳转到授权页面...")
                 authorize_url = f"{REG_OIDC}/authorize?" + urlencode({
                     "response_type": "code",
@@ -474,8 +478,13 @@ async def register_with_roxy(
                     "code_challenge": code_challenge,
                     "code_challenge_method": "S256",
                 })
-                await page.goto(authorize_url, timeout=60000)
-                await page.wait_for_load_state("networkidle", timeout=30000)
+                try:
+                    await page.goto(authorize_url, timeout=60000, wait_until="domcontentloaded")
+                except Exception as e:
+                    if authorization_code:
+                        log("授权码已通过路由拦截获取", "ok")
+                    else:
+                        log(f"authorize 导航: {str(e)[:80]}", "dbg")
                 await asyncio.sleep(3)
 
             # 等待到达 signin.aws 或 profile.aws
@@ -488,9 +497,40 @@ async def register_with_roxy(
 
             # 如果在 signin.aws，输入邮箱
             if "signin.aws" in page.url:
-                email_input = page.locator('xpath=//input[@type="email"]')
-                if await email_input.count() == 0:
-                    email_input = page.locator('xpath=//input[@type="text"]').first
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(3)
+                log(f"signin.aws 页面 URL: {page.url}", "dbg")
+
+                # 可能需要先点击 "Create one" / "Create your AWS Builder ID" 链接
+                create_link = page.locator('xpath=//a[contains(text(),"Create") or contains(text(),"create")]')
+                if await create_link.count() > 0 and await create_link.first.is_visible():
+                    await create_link.first.click()
+                    log("点击了 Create 链接", "ok")
+                    await asyncio.sleep(3)
+
+                # 等待邮箱输入框出现
+                email_input = None
+                for _retry in range(10):
+                    for sel in [
+                        'xpath=//input[@type="email"]',
+                        'xpath=//input[@name="email"]',
+                        'xpath=//input[contains(@id,"email")]',
+                        'xpath=//input[@type="text"]',
+                    ]:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            email_input = loc.first
+                            break
+                    if email_input:
+                        break
+                    await asyncio.sleep(2)
+
+                if not email_input:
+                    log(f"signin.aws 未找到邮箱输入框 (URL: {page.url})", "err")
+                    await browser.close()
+                    _cleanup()
+                    return _partial_result("signin邮箱输入框未找到")
+
                 await _move_to_element(page, email_input)
                 await _human_type(page, email_input, email)
                 await _human_delay(0.8, 1.5)
@@ -509,7 +549,6 @@ async def register_with_roxy(
             if "profile.aws" not in page.url:
                 log(f"未能到达注册页面 (当前: {page.url})", "err")
                 await browser.close()
-                callback_server.shutdown()
                 _cleanup()
                 return _partial_result("未到达注册页面")
 
@@ -693,7 +732,6 @@ async def register_with_roxy(
                 if not otp_input:
                     log("未找到 OTP 输入框!", "err")
                     await browser.close()
-                    callback_server.shutdown()
                     _cleanup()
                     return _partial_result("OTP输入框未找到")
 
@@ -702,7 +740,6 @@ async def register_with_roxy(
                 if not otp_code:
                     log("OTP 等待超时!", "err")
                     await browser.close()
-                    callback_server.shutdown()
                     _cleanup()
                     return _partial_result("OTP超时")
 
@@ -789,12 +826,17 @@ async def register_with_roxy(
                 log("阶段 5: 设置密码")
                 await _human_delay(1.5, 3.0)
                 pwd_inputs = page.locator('xpath=//input[@type="password"]')
+                # 等待两个密码框都出现（新密码 + 确认密码）
+                for _wait in range(10):
+                    count = await pwd_inputs.count()
+                    if count >= 2:
+                        break
+                    await asyncio.sleep(1)
+                else:
+                    count = await pwd_inputs.count()
+                log(f"检测到 {count} 个密码输入框", "dbg")
                 for attempt in range(3):
                     try:
-                        count = await pwd_inputs.count()
-                        if count < 2 and attempt == 0:
-                            await asyncio.sleep(2)
-                            count = await pwd_inputs.count()
                         await _move_to_element(page, pwd_inputs.first)
                         await _human_type(page, pwd_inputs.first, password, min_delay=30, max_delay=90)
                         await _human_delay(0.5, 1.2)
@@ -862,7 +904,6 @@ async def register_with_roxy(
                 if cancel_check and cancel_check():
                     log("用户取消", "err")
                     await browser.close()
-                    callback_server.shutdown()
                     _cleanup()
                     return _partial_result("用户取消")
                 if authorization_code:
@@ -898,7 +939,6 @@ async def register_with_roxy(
 
             await browser.close()
     finally:
-        callback_server.shutdown()
         _cleanup()
 
     # ─── Phase 7: Token 交换 ──────────────────────────────────────────
