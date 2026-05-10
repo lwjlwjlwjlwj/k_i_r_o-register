@@ -341,7 +341,14 @@ async def register_with_roxy(
     s = _requests.Session()
     s.verify = False
 
-    if mail_provider_instance:
+    # 始终使用 _RequestsMailClient 避免 curl_cffi SSL 问题
+    if mail_provider_instance and not isinstance(mail_provider_instance, _RequestsMailClient):
+        mail = _RequestsMailClient(
+            base_url=mail_provider_instance.base_url if hasattr(mail_provider_instance, 'base_url') else (mail_url or ""),
+            api_key=mail_provider_instance.api_key if hasattr(mail_provider_instance, 'api_key') else (mail_key or ""),
+            domain_id=mail_provider_instance.domain_id if hasattr(mail_provider_instance, 'domain_id') else mail_domain_id,
+        )
+    elif mail_provider_instance:
         mail = mail_provider_instance
     else:
         mail = _RequestsMailClient(base_url=mail_url, api_key=mail_key, domain_id=mail_domain_id)
