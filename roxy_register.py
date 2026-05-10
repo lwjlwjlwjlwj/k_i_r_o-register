@@ -198,6 +198,45 @@ class RoxyBrowser:
         )
         return r.json().get("code") == 0
 
+    def update_window(self, workspace_id: int, dir_id: str, finger_info: dict = None) -> bool:
+        """通过 /browser/mdf 修改窗口配置"""
+        payload = {"workspaceId": workspace_id, "dirId": dir_id}
+        if finger_info:
+            payload.update(finger_info)
+        try:
+            r = _requests.post(
+                f"{self.base_url}/browser/mdf", headers=self.headers,
+                json=payload, timeout=15
+            )
+            return r.json().get("code") == 0
+        except Exception:
+            return False
+
+    def clear_cache(self, workspace_id: int, dir_id: str) -> bool:
+        """清除窗口的本地缓存和服务器缓存"""
+        ok1 = ok2 = False
+        try:
+            r = _requests.post(
+                f"{self.base_url}/browser/clear_local_cache", headers=self.headers,
+                json={"dirIds": [dir_id]}, timeout=10
+            )
+            ok1 = r.json().get("code") == 0
+        except Exception:
+            pass
+        try:
+            r = _requests.post(
+                f"{self.base_url}/browser/clear_server_cache", headers=self.headers,
+                json={"workspaceId": workspace_id, "dirIds": [dir_id]}, timeout=10
+            )
+            ok2 = r.json().get("code") == 0
+        except Exception:
+            pass
+        return ok1 or ok2
+
+
+# 工作空间轮询计数器（跨调用保持状态）
+_workspace_round_robin_index = 0
+
 
 async def register_with_roxy(
     api_key: str = "",
@@ -252,9 +291,15 @@ async def register_with_roxy(
     if not workspaces:
         log("未找到工作空间，请先在 RoxyBrowser 中创建", "err")
         return None
-    workspace_id = workspaces[0].get("id") or workspaces[0].get("workspaceId")
-    ws_name = workspaces[0].get("workspaceName") or workspaces[0].get("name", str(workspace_id))
-    log(f"使用工作空间: {ws_name} (id={workspace_id})")
+
+    # 轮询使用工作空间，避免一直用同一个
+    global _workspace_round_robin_index
+    ws_idx = _workspace_round_robin_index % len(workspaces)
+    _workspace_round_robin_index += 1
+    chosen_ws = workspaces[ws_idx]
+    workspace_id = chosen_ws.get("id") or chosen_ws.get("workspaceId")
+    ws_name = chosen_ws.get("workspaceName") or chosen_ws.get("name", str(workspace_id))
+    log(f"使用工作空间: {ws_name} (id={workspace_id}) [{ws_idx+1}/{len(workspaces)}]")
 
     # 优先复用已有的关闭状态窗口，避免每次创建新窗口
     created_new = False
@@ -265,9 +310,10 @@ async def register_with_roxy(
         chosen = _random.choice(closed_windows)
         dir_id = chosen.get("dirId")
         log(f"复用已有窗口: {chosen.get('windowName', '')} ({dir_id[:16]}...)")
-        # 随机化指纹
+        # 随机化指纹 + 清除旧数据
         roxy.randomize_fingerprint(workspace_id, dir_id)
-        log("已随机化指纹", "ok")
+        roxy.clear_cache(workspace_id, dir_id)
+        log("已随机化指纹并清除缓存", "ok")
     else:
         # 没有可用窗口，创建新的
         window_name = f"kiro_reg_{int(time.time())}"
@@ -328,6 +374,13 @@ async def register_with_roxy(
     def _cleanup():
         try:
             roxy.close_window(dir_id)
+        except Exception:
+            pass
+        # 使用完后重置窗口：随机化指纹 + 清除 cookie/缓存/localStorage
+        try:
+            roxy.randomize_fingerprint(workspace_id, dir_id)
+            roxy.clear_cache(workspace_id, dir_id)
+            log("窗口已重置 (指纹+缓存清除)", "ok")
         except Exception:
             pass
         if delete_after and created_new:
