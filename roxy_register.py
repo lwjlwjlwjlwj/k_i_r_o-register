@@ -504,15 +504,26 @@ async def register_with_roxy(
 
             # 如果在 signin.aws，输入邮箱
             if "signin.aws" in page.url and not authorization_code:
-                email_input = page.locator('xpath=//input[@type="email"]')
-                if await email_input.count() == 0:
-                    email_input = page.locator('xpath=//input[@type="text"]').first
-                if await email_input.count() > 0:
-                    await email_input.first.fill(email)
+                # 等待 email 输入框渲染（无头模式下可能较慢）
+                email_input = None
+                for _ew in range(10):
+                    loc = page.locator('xpath=//input[@type="email"]')
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        email_input = loc.first
+                        break
+                    loc = page.locator('xpath=//input[@type="text"]')
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        email_input = loc.first
+                        break
+                    await asyncio.sleep(1)
+                if email_input:
+                    await email_input.fill(email)
                     log(f"邮箱已填入: {email}", "ok")
                     await asyncio.sleep(0.5)
                     await _js_click_submit()
                     await asyncio.sleep(4)
+                else:
+                    log("signin.aws 未找到邮箱输入框", "warn")
 
             # 等待 profile.aws
             if not authorization_code:
@@ -584,8 +595,8 @@ async def register_with_roxy(
                     return "EMAIL"
                 if "awsapps.com" in result["url"] and result["hasConsentBtn"]:
                     return "CONSENT"
-                if "profile.aws" in result["url"] and not result["isLoading"]:
-                    return "OTP"
+                if "profile.aws" in result["url"]:
+                    return "LOADING"
                 if result["isLoading"]:
                     return "LOADING"
                 return "UNKNOWN"
@@ -607,8 +618,21 @@ async def register_with_roxy(
             await asyncio.sleep(2)
             await _dismiss_cookie(page)
 
-            state = await wait_for_state(["NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
+            state = await wait_for_state(["EMAIL", "NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
             log(f"当前状态: {state}, URL: {page.url[:80]}")
+
+            # EMAIL（signin.aws 邮箱未填成功时的兜底）
+            if state == "EMAIL":
+                email_input = page.locator('xpath=//input[@type="email"]')
+                if await email_input.count() == 0:
+                    email_input = page.locator('xpath=//input[@type="text"]')
+                if await email_input.count() > 0:
+                    await email_input.first.fill(email)
+                    log(f"邮箱已填入 (状态机兜底): {email}", "ok")
+                    await asyncio.sleep(0.5)
+                    await _js_click_submit()
+                    await asyncio.sleep(4)
+                state = await detect_state()
 
             # NAME
             if state == "NAME":

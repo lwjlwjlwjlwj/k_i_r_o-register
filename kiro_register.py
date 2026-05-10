@@ -882,11 +882,40 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             await asyncio.sleep(2)
             await _dismiss_cookie(page)
 
-            state = await wait_for_state(["NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
+            state = await wait_for_state(["EMAIL", "NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
             if state == "CANCELLED":
                 await browser.close()
                 callback_server.shutdown()
                 return _partial_result("用户取消")
+
+            # EMAIL（signin.aws 邮箱未填成功时的兜底）
+            if state == "EMAIL":
+                email_input = page.locator('xpath=//input[@type="email"]')
+                if await email_input.count() == 0:
+                    email_input = page.locator('xpath=//input[@type="text"]')
+                if await email_input.count() > 0:
+                    await _move_to_element(page, email_input.first)
+                    await _human_type(page, email_input.first, email)
+                    await _human_delay(0.5, 1.0)
+                    log(f"邮箱已填入 (状态机兜底): {email}", "ok")
+                    await page.evaluate("""() => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+                        for (const b of visible) {
+                            const t = (b.innerText || '').toLowerCase();
+                            if (t.includes('continue') || t.includes('next') || t.includes('submit') || t.includes('verify')) {
+                                b.click(); return;
+                            }
+                        }
+                        if (visible.length > 0) visible[visible.length - 1].click();
+                    }""")
+                    await _human_delay(3, 5)
+                state = await wait_for_state(["NAME", "OTP", "PASSWORD", "CONSENT", "DONE"], timeout=30)
+                if state == "CANCELLED":
+                    await browser.close()
+                    callback_server.shutdown()
+                    return _partial_result("用户取消")
+
             if state == "NAME":
                 name_field = page.locator('xpath=//input[contains(@placeholder,"Silva")]')
                 for attempt in range(3):
